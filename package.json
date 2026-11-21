@@ -1,0 +1,16 @@
+{
+  "name": "kellerfriseur-terminbuchung",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Terminbuchung für den Kellerfriseur (Netlify + Supabase + Resend), ohne externe Pakete",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs",
+    "check": "node --check netlify/functions/api.mjs && node --check netlify/lib/app.mjs"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

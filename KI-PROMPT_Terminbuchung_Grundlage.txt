@@ -1,0 +1,180 @@
+=====================================================================
+PROMPT FÜR EINE ANDERE KI – bitte alles ab der nächsten Zeile kopieren
+=====================================================================
+
+ROLLE
+Du bist ein erfahrener Full-Stack-Entwickler (PostgreSQL/Supabase und Vanilla-JavaScript). Du baust die Grundlage einer Terminbuchungs-Website für einen Friseursalon namens „Kellerfriseur“. Der Auftraggeber ist kein Programmierer und kann Fehler nicht selbst beheben. Der Code muss deshalb beim ersten Einfügen funktionieren.
+
+ARBEITSWEISE (verbindlich)
+- Stelle KEINE Rückfragen. Wo etwas offen ist, gelten die Entscheidungen in diesem Prompt. Triff sonst die sicherste, einfachste Wahl und nenne sie am Ende in einem Satz.
+- Liefere die VOLLSTÄNDIGE Lösung. Keine vereinfachte Version, keine „…“, keine „hier ergänzen“, keine „TODO“, keine Attrappen. Jede sichtbare Schaltfläche muss funktionieren.
+- Wenn die Antwort für eine Nachricht zu lang wird: teile sie in nummerierte Teile („SQL Teil 1/2“, „HTML Teil 2/3“ …) an sauberen Grenzen, ohne Auslassungen, und gib sie direkt nacheinander aus.
+- Prüfe vor der Ausgabe alles gegen die ABNAHME-CHECKLISTE ganz unten. Kannst du Code ausführen, teste das SQL gegen PostgreSQL 15 oder neuer.
+
+ARCHITEKTUR (fest vorgegeben)
+- Genau EINE Datei index.html (HTML, CSS und JavaScript inline, keine Build-Schritte) plus SQL für Supabase.
+- Kein Netlify-Backend, keine Netlify Functions, kein Node-Server.
+- Der Browser spricht direkt mit Supabase über supabase-js, geladen per CDN: https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js
+- Im HTML stehen nur zwei Werte zum Eintragen, ganz oben im Skript:
+  const SUPABASE_URL = 'HIER_EINTRAGEN';
+  const SUPABASE_KEY = 'HIER_EINTRAGEN';   // der öffentliche „Publishable key“ bzw. „anon key“
+  Sind sie nicht ausgefüllt, zeigt die Seite eine deutliche deutsche Fehlermeldung statt einer leeren Seite.
+- Der geheime service_role-/Secret-Key darf NIE im HTML stehen. Der öffentliche Key ist unkritisch, weil die Sicherheit komplett in der Datenbank liegt (siehe unten).
+- E-Mail-Funktionen werden KOMPLETT weggelassen (kein Versand, kein Resend). Die E-Mail-Adresse des Kunden wird trotzdem gespeichert, damit E-Mails später ergänzt werden können.
+- Routen in der einen Datei über den URL-Hash:
+  • kein Hash        → Kunden-Buchungsseite (Startseite, nichts anderes)
+  • #t=TOKEN         → persönliche Terminverwaltung des Kunden
+  • #admin           → Adminbereich (nirgends auf der öffentlichen Seite verlinkt)
+- Sprache der Oberfläche: Deutsch. Alle Zeiten werden immer in Europa/Berlin angezeigt und berechnet, unabhängig von der Zeitzone des Geräts.
+
+DATENBANK (Supabase / PostgreSQL)
+Allgemeine Regeln für das SQL:
+- Alle Objekte beginnen mit „kf_“. Bestehende fremde Tabellen im Projekt werden nicht verändert oder gelöscht.
+- Skript 1 (Hauptskript): bricht mit einer verständlichen Meldung ab, wenn kf_-Tabellen schon existieren (damit nichts überschrieben wird). Ganz in einer Transaktion (begin … commit).
+- Skript 2 (optional, getrennt und deutlich beschriftet): löscht NUR kf_-Objekte, mit Warnhinweis („löscht alle Termine“), für einen Neustart.
+- Skript 3: Befehle für den ersten Admin (siehe unten), mit klar markiertem Platzhalter für die E-Mail-Adresse.
+- Der Zeitraum eines Termins wird als start_at/end_at (timestamptz, UTC) gespeichert.
+
+Tabellen (mindestens):
+- kf_settings (genau 1 Zeile, id = 1 per check): duration_minutes (Standard 60, erlaubt 5–720), booking_horizon_days (Standard 30, erlaubt 1–365), min_lead_minutes (Standard 0), contact_email (Standard 'lcordella818@gmail.com'), business_name (Standard 'Kellerfriseur').
+- kf_admins: id, user_id (uuid, verweist auf auth.users, unique), email, name, role ('owner' | 'admin'), active (boolean), created_at.
+- kf_bookings: id uuid, start_at, end_at, status ('requested' | 'confirmed' | 'declined' | 'withdrawn' | 'cancelled'), source ('online' | 'manual'), customer_name, customer_email (darf bei manuellen Terminen leer sein), customer_phone, customer_note, internal_note, token_hash (sha256 als Hex, unique), cancelled_by, decided_at, decided_by, created_by, created_at, updated_at; Längenprüfungen per check; end_at > start_at.
+- kf_blocks: id, start_at, end_at, reason, created_by, created_at; end_at > start_at.
+- kf_rate_limits: key, window_start, hits (primary key aus key + window_start).
+
+Doppelbuchungsschutz (zwingend, zweistufig):
+1. Exclusion-Constraint auf kf_bookings:
+   exclude using gist (tstzrange(start_at, end_at, '[)') with &&) where (status in ('requested','confirmed'))
+   („[)“ = Ende exklusiv, damit 09:00–10:00 und 10:00–11:00 direkt hintereinander erlaubt sind. btree_gist wird dafür nicht benötigt.)
+2. Alle schreibenden Funktionen nehmen am Anfang pg_advisory_xact_lock(727001) und fangen exclusion_violation ab, um eine saubere Fehlermeldung zu liefern.
+
+Sicherheit (zwingend):
+- Row Level Security auf ALLEN kf_-Tabellen aktivieren, KEINE Policies anlegen, und alle Tabellenrechte für public, anon und authenticated entziehen (revoke all). Niemand greift direkt auf Tabellen zu.
+- Aller Zugriff läuft ausschließlich über Funktionen mit „security definer“ und „set search_path = public, extensions, pg_temp“. Bei jeder Funktion: erst „revoke all on function … from public, anon, authenticated“, dann gezielt „grant execute“ (siehe unten). Supabase vergibt sonst standardmäßig Rechte an anon.
+- Verwende benannte Parameter mit Präfix p_ und KEINE überladenen Funktionen (PostgREST-Mehrdeutigkeit). Am Ende des Skripts: notify pgrst, 'reload schema';
+- Fehler werden mit „raise exception 'KF_…'“ gemeldet, mit festen Kürzeln: KF_SLOT_TAKEN, KF_IN_PAST, KF_TOO_FAR, KF_BAD_START, KF_TOO_MANY (zu viele aktive Termine pro E-Mail), KF_RATE_LIMIT, KF_NOT_ADMIN, KF_NOT_OWNER, KF_NOT_FOUND, KF_NOT_ACTIVE, KF_STATE_CHANGED, KF_INVALID. Das HTML übersetzt jedes Kürzel in eine freundliche deutsche Meldung; unbekannte Fehler zeigen eine neutrale Meldung ohne technische Details.
+- Rate-Limiting in der Datenbank (Tabelle kf_rate_limits): die IP kommt aus current_setting('request.headers', true)::json ->> 'x-forwarded-for' (erstes Element; fehlt sie, 'unknown'). Grenzen: Buchung 4 pro Minute und 12 pro Stunde je IP, 6 pro Tag je E-Mail; Token-Abfragen 60 pro Minute je IP; Verfügbarkeitsabfragen 120 pro Minute je IP. Alte Zeilen gelegentlich löschen.
+
+Öffentliche Funktionen (grant execute an anon UND authenticated):
+- kf_get_public_state(p_from timestamptz, p_to timestamptz) → jsonb mit durationMinutes, horizonDays, minLeadMinutes und busy = Liste von [start_ms, end_ms] (Millisekunden seit 1970) aller AKTIVEN Termine (requested, confirmed) und aller Sperrzeiten, nicht unterscheidbar. Niemals Namen, E-Mails, Telefon, Notizen, Status oder die Art der Belegung zurückgeben.
+- kf_create_booking(p_name, p_email, p_phone, p_note, p_start) → jsonb {token, start, end, status}. Die Dauer kommt IMMER aus kf_settings, nie vom Kunden. Prüft in dieser Reihenfolge: Rate-Limit, Eingaben (Name mindestens 2 Zeichen und aus mindestens 2 Wörtern, E-Mail-Format, Telefon optional, Notiz maximal 1000 Zeichen, Steuerzeichen entfernen), Startzeit liegt auf dem 15-Minuten-Raster (extract(epoch from p_start)::bigint % 900 = 0, keine Sekunden), Startzeit ist in der Zukunft und nach dem Mindestvorlauf, Berliner Datum nicht weiter als booking_horizon_days in der Zukunft ((p_start at time zone 'Europe/Berlin')::date <= (now() at time zone 'Europe/Berlin')::date + horizon), höchstens 3 aktive zukünftige Termine pro E-Mail (Groß-/Kleinschreibung egal), keine Überschneidung mit Sperrzeiten, dann Insert (Status 'requested', source 'online'). Der Token entsteht in der Datenbank zufällig (mindestens 256 Bit, z. B. encode(extensions.gen_random_bytes(32),'hex') oder zwei gen_random_uuid() ohne Bindestriche), wird EINMAL zurückgegeben, und in der Tabelle steht nur sein SHA-256-Hash (encode(sha256(convert_to(token,'UTF8')),'hex')).
+- kf_get_booking_by_token(p_token) → jsonb {name, status, start, end, canCancel, action}. Nur diese Felder, sonst nichts (keine E-Mail, kein Telefon, keine Notizen). Ungültiger Token → KF_NOT_FOUND.
+- kf_cancel_booking_by_token(p_token) → offene Anfrage wird 'withdrawn', bestätigter Termin wird 'cancelled' (cancelled_by = 'customer'). Nur wenn der Termin aktiv ist und start_at in der Zukunft liegt; vergangene, abgesagte, abgelehnte oder zurückgezogene Termine werden nicht verändert (KF_STATE_CHANGED bzw. KF_NOT_ACTIVE). Der Zeitraum ist danach sofort wieder frei.
+
+Admin-Funktionen (grant execute NUR an authenticated; jede prüft zuerst kf_is_admin() und wirft sonst KF_NOT_ADMIN):
+- kf_is_admin() (stable, security definer): exists(select 1 from kf_admins where user_id = auth.uid() and active).
+- kf_admin_me() → {email, name, role}.
+- kf_admin_list_requests() → alle Termine mit Status 'requested', nach Startzeit sortiert, mit vollständigen Kundendaten (Name, E-Mail, Telefon, Notiz).
+- kf_admin_decide(p_id, p_action) mit 'accept' (requested → confirmed) oder 'decline' (requested → declined); sonst KF_STATE_CHANGED. Kein Ablehnungsgrund nötig.
+- kf_admin_calendar(p_from, p_to, p_history boolean) → Termine (mit allen Feldern inklusive interner Notiz) und Sperrzeiten im Bereich. Ohne p_history: requested, confirmed, cancelled; mit p_history zusätzlich declined und withdrawn.
+- kf_admin_create_booking(p_name, p_email, p_phone, p_note, p_internal, p_start_local text, p_duration_minutes) → manueller Termin, Status 'confirmed', source 'manual'. p_start_local ist 'YYYY-MM-DD HH24:MI' als Berliner Ortszeit; die Funktion wandelt mit „at time zone 'Europe/Berlin'“ um und lehnt Zeiten ab, die es wegen der Zeitumstellung nicht gibt (Rundlauf-Prüfung). Beliebige Minute und Dauer 5–720 erlaubt, auch rückwirkend. E-Mail und Telefon optional.
+- kf_admin_update_booking(p_id, …Felder…, p_start_local, p_duration_minutes) → Bearbeiten und Verschieben, mit Sperre und Konfliktschutz; nur aktive Termine dürfen zeitlich verschoben werden, bei anderen Status nur Notizen/Kontaktdaten.
+- kf_admin_cancel_booking(p_id) → bestätigten Termin absagen (Status 'cancelled', cancelled_by 'admin').
+- kf_admin_delete_booking(p_id) → endgültig löschen.
+- kf_admin_search(p_q) → Suche nach Name, E-Mail, Telefon (mindestens 2 Zeichen). LIKE-Sonderzeichen (% _ \) werden escaped. Telefonnummern werden auf Ziffern normalisiert, sodass „+49 171 …“, „0049 171 …“ und „0171 …“ dieselbe Nummer finden. Maximal 300 Treffer, neueste zuerst.
+- kf_admin_list_blocks() → zukünftige und laufende Sperrzeiten.
+- kf_admin_create_block(p_mode text, p_from text, p_to text, p_reason text, p_ack boolean): Modus 'days' (p_from/p_to sind Daten 'YYYY-MM-DD', beide inklusive, ganze Berliner Tage, 00:00 bis zum Beginn des Folgetags) oder 'range' (Ortszeit 'YYYY-MM-DD HH24:MI'). Liegen aktive Termine im Zeitraum und ist p_ack falsch, wird NICHTS angelegt und die Konfliktliste zurückgegeben. Mit p_ack = true wird die Sperre angelegt; bestehende Termine werden dabei NIEMALS gelöscht oder verändert.
+- kf_admin_delete_block(p_id).
+- kf_admin_get_settings() und kf_admin_update_settings(p_duration_minutes, p_horizon_days, p_min_lead_minutes, p_contact_email, p_business_name) mit Wertebereichsprüfung.
+- kf_admin_list_admins() und kf_admin_set_admin_active(p_id, p_active): nur für role 'owner'; ein Owner kann sich selbst und andere Owner nicht deaktivieren.
+
+Erster Admin und weitere Admins OHNE Programmierung:
+- Es gibt keine öffentliche Registrierung. Im Supabase-Dashboard wird die Option für neue Registrierungen ausgeschaltet.
+- Admin-Konten werden im Supabase-Dashboard unter Authentication > Users > „Add user“ angelegt (E-Mail, Passwort, „Auto Confirm User“ aktiv).
+- Skript 3 stellt dafür die Funktion kf_make_admin(p_email text, p_name text, p_role text) bereit, die den Auth-Benutzer per E-Mail in auth.users sucht und in kf_admins einträgt. Sie ist nur für den SQL-Editor gedacht (kein grant an anon/authenticated). Zeige zwei fertige Beispielaufrufe: einen für den Hauptadministrator (role 'owner') und einen für den Friseur (role 'admin'), jeweils mit Platzhalter-E-Mail.
+- Im Adminbereich meldet man sich mit supabase.auth.signInWithPassword an; die Sitzung verwaltet supabase-js. Ein Benutzer ohne Eintrag in kf_admins sieht nach der Anmeldung nur „Kein Zugriff“ und wird abgemeldet.
+
+KUNDENBEREICH (Startseite, sonst nichts)
+- Der Kunde landet direkt auf der Buchung: keine Unterseiten, keine Vorstellung des Friseurs, keine Leistungsbeschreibung, keine Navigation.
+- Ablauf: Kalender sehen → Tag wählen → verfügbare Uhrzeiten sehen → Startzeit wählen → Formular → absenden → Erfolgsmeldung. Die Anfrage wird gespeichert und der Zeitraum sofort reserviert.
+- Formular: Pflicht = Vorname, Nachname, E-Mail. Freiwillig = Telefon, Notizen. Keine Adresse, keine Dienstleistungsauswahl. Unsichtbares Honeypot-Feld (per CSS aus dem sichtbaren Bereich, nicht display:none): ist es gefüllt, tut die Seite so, als sei alles gut, sendet aber nichts. Doppelklick auf „Absenden“ wird verhindert (Button sperren, solange die Anfrage läuft).
+- Vor dem Absenden lädt die Seite die Belegung neu. Bei KF_SLOT_TAKEN erscheint eine freundliche Meldung („Diese Zeit wurde gerade vergeben“), die Zeiten werden neu geladen und der Kunde wählt neu, ohne seine Eingaben zu verlieren.
+- Erfolgsmeldung (wegen fehlender E-Mails angepasst): „Deine Terminanfrage wurde erfolgreich übermittelt. Du kannst den Stand deines Termins jederzeit über deinen persönlichen Link einsehen. Bitte speichere ihn jetzt.“ Darunter der persönliche Link (https://…/#t=TOKEN, aus location.origin + location.pathname gebaut), ein Button „Link kopieren“ und ein Button „Meinen Termin verwalten“. Der Link wird zusätzlich in localStorage gemerkt (in try/catch).
+- Kalender: Umschalter „Woche | Monat“ (Standard Monat auf Handy und Desktop), Vor/Zurück, „Heute“, beliebig viele Wochen blätterbar, aber nur Tage innerhalb der Buchungsfrist (Standard 30 Tage, aus den Einstellungen) sind wählbar; andere Tage sind sichtbar deaktiviert. Der Monat wird immer vollständig dargestellt (Montag als Wochenanfang). Ein Tag zeigt „frei“ oder „belegt/voll“ (Anzahl freier Zeiten genügt). Die Abfrage deckt höchstens 42 Tage auf einmal ab.
+- Uhrzeiten des gewählten Tages: Raster in 15-Minuten-Schritten über den ganzen Tag (00:00 bis 23:45), gruppiert in Nacht (0–6), Vormittag (6–12), Nachmittag (12–18), Abend (18–24). Freie Zeiten sind große, gut tippbare Schaltflächen; belegte und vergangene Zeiten sind sichtbar deaktiviert (belegt = Termin ODER Sperrzeit, nicht unterscheidbar). Eine Startzeit ist nur frei, wenn der ganze Termin (Startzeit + Dauer aus den Einstellungen) kein belegtes Intervall schneidet. Intervalle sind halboffen: ein Termin, der genau dann endet, wenn der nächste beginnt, ist keine Überschneidung.
+- Sommerzeit: Berechne Tage und Slots mit Intl.DateTimeFormat (timeZone 'Europe/Berlin'), nicht mit der Zeitzone des Geräts. Der Umstellungstag im März hat 92 Startzeiten, im Oktober 100. Slot-Startzeiten werden als UTC-Zeitpunkte (ISO-String mit Z) an die Datenbank gesendet.
+- Der Server entscheidet endgültig. Die Berechnung im Browser dient nur der Anzeige.
+
+VERFÜGBARKEIT (24/7-Grundregel)
+- Grundsätzlich ist 24 Stunden am Tag, 7 Tage die Woche verfügbar (00:00–23:59). Es gibt KEINE festen Öffnungszeiten und keine Wochentage-Einstellung.
+- Nicht verfügbar ist nur, was der Admin als Sperrzeit einträgt (ganze Tage, Urlaub über viele Wochen, Teilzeiten wie 11:00–14:00, beliebig viele) oder was durch aktive Termine belegt ist.
+
+TERMINDAUER UND STARTZEITEN
+- Standarddauer 60 Minuten. Im Adminbereich einstellbar: Auswahl 30, 45, 60, 90 Minuten oder „Frei“ mit eigenem Minutenwert (5–720).
+- Startzeiten immer im 15-Minuten-Raster. Keine Pufferzeiten; direkt aufeinanderfolgende Termine sind erlaubt.
+- Keine zeitliche Überschneidung aktiver Termine, geprüft in der Datenbank.
+
+STATUS UND RESERVIERUNG
+- Status: Offen/angefragt (requested), Bestätigt (confirmed), Abgelehnt (declined), Zurückgezogen (withdrawn), Abgesagt (cancelled). „Manuell eingetragen“ ist die Herkunft (source = 'manual') und wird in der Oberfläche als Kennzeichnung „Manuell eingetragen“ gezeigt; ein manueller Termin hat den Status 'confirmed'.
+- Offen, bestätigt und manuell blockieren den Zeitraum sofort. Abgelehnt, zurückgezogen und abgesagt geben ihn sofort frei.
+- Zwei Kunden, die fast gleichzeitig buchen, dürfen nie denselben Zeitraum bekommen (siehe Doppelbuchungsschutz).
+
+ADMINBEREICH (#admin) – funktioniert auf Smartphone, Tablet, Desktop
+- Anmeldemaske (E-Mail, Passwort), Fehlermeldungen ohne Details, Abmelden-Schaltfläche. Nach der Anmeldung Tabs: Anfragen · Kalender · Neuer Termin · Suche · Sperrzeiten · Einstellungen · Admins (nur Owner) · Konto (Passwort ändern über supabase.auth.updateUser, Abmelden).
+- Startseite = Tab „Anfragen“ und zeigt AUSSCHLIESSLICH die offenen Anfragen, ohne Statistiken. Pro Eintrag: Kundenname, Datum, Uhrzeit, Status „Offen“. Antippen öffnet die Details: Vor- und Nachname, E-Mail, Telefon (falls vorhanden), Datum, Uhrzeit, Notizen. Zwei große Schaltflächen: „Termin annehmen“ und „Termin ablehnen“. Danach verschwindet die Anfrage aus der Liste. Die Zahl offener Anfragen steht als Zähler am Tab.
+- Kalender mit Monats-, Wochen- und Tagesansicht, einfach umschaltbar, mit Vor/Zurück/Heute. Farben: Gelb = offene Anfrage, Grün = bestätigt, Rot = abgesagt; Sperrzeiten grau schraffiert; Schalter „Historie“ blendet abgelehnte und zurückgezogene Termine grau ein (sie blockieren keine Zeit). Wochen- und Tagesansicht als Zeitraster über 24 Stunden (Berliner Zeit), Ereignisse nach Beginn und Dauer positioniert, überlappende nebeneinander. Beim Öffnen scrollt das Raster zu etwa 07:00. Antippen eines Termins zeigt alle Informationen (inklusive interner Notiz, Herkunft, Status) und die zum Status passenden Aktionen: Annehmen/Ablehnen (offen), Bearbeiten/Verschieben, Absagen (bestätigt), Löschen (mit Sicherheitsabfrage). Antippen eines Tags in der Monatsansicht öffnet die Tagesansicht.
+- Neuer Termin (manuell): Kundenname, E-Mail (optional), Telefon (optional), Datum, Startzeit (beliebige Minute), Dauer (30/45/60/90/frei), interne Notiz. Blockiert den Zeitraum. Bei Konflikt klare Meldung.
+- Bearbeiten/Verschieben: dasselbe Formular, vorbefüllt.
+- Suche: Eingabefeld für Name, E-Mail oder Telefon; Treffer gruppiert nach Kunde mit allen bisherigen und zukünftigen Terminen. Nur für angemeldete Admins.
+- Sperrzeiten: Formular mit Umschalter „Ganze Tage“ (von/bis-Datum) oder „Zeitraum“ (Datum+Uhrzeit von/bis), Grund optional. Gibt es Konflikte, zeigt die Seite die betroffenen Termine mit dem Hinweis „Diese Termine bleiben bestehen und werden NICHT gelöscht“ und bietet „Trotzdem sperren“ an. Darunter die Liste aller aktuellen Sperrzeiten mit „Löschen“.
+- Einstellungen: Termindauer (30/45/60/90/frei), Buchungsfrist in Tagen (Standard 30), Mindestvorlauf in Minuten, Kontakt-E-Mail (zunächst lcordella818@gmail.com), Name des Salons. Speichern mit Erfolgs-/Fehlermeldung.
+- Admins (nur Owner): Liste mit Name, E-Mail, Rolle, aktiv; Aktivieren/Deaktivieren. Dazu ein Hinweistext, wie man im Supabase-Dashboard neue Admins anlegt.
+- Interne Notizen und alle Kundendaten kommen nur über die Admin-Funktionen und werden nie an die öffentliche Seite oder den Kundenlink geliefert.
+
+TERMINVERWALTUNG DES KUNDEN (#t=TOKEN)
+- Der Kunde braucht kein Konto und kein Passwort. Die Seite liest den Token aus dem Hash, ruft kf_get_booking_by_token auf und zeigt Name, Datum, Uhrzeit und Status als farbiges Etikett.
+- Aktionen: offene Anfrage „zurückziehen“, bestätigten Termin „absagen“. Vor der endgültigen Absage erscheint ein Dialog („Möchtest du wirklich absagen?“ mit „Zurück“ und „Ja, absagen“). Absagen sind jederzeit möglich, auch kurzfristig, solange der Termin noch nicht begonnen hat. Danach ist der Zeitraum sofort frei.
+- Vergangene und bereits abgesagte/abgelehnte/zurückgezogene Termine zeigen nur den Status, ohne Aktion.
+- Ungültiger Link: freundliche Meldung „Dieser Link ist ungültig.“ – ohne Hinweis darauf, ob es den Termin gab.
+
+SICHERHEIT IM FRONTEND
+- Daten aus der Datenbank werden NIE per innerHTML eingefügt. Verwende textContent bzw. document.createElement, damit Eingaben wie <script> wirkungslos bleiben.
+- Keine Geheimnisse, keine Passwörter oder Tokens in console.log. Fehler dem Nutzer freundlich zeigen.
+- localStorage immer in try/catch verwenden; die Seite muss auch ohne funktionieren.
+- <meta name="robots" content="noindex"> und <meta name="viewport" content="width=device-width, initial-scale=1">.
+
+DESIGN
+- Schlicht, modern, hochwertig: weißer/heller Hintergrund, dunkle gut lesbare Schrift, dezente Akzentfarbe Petrol #2f6f6a, große gut tippbare Schaltflächen (mindestens 48 px hoch), einfaches Formular, kein Overlay-Chaos, keine unnötigen Animationen.
+- Voll responsiv: Smartphone, Tablet, Desktop; der Adminbereich ist auf dem Tablet bequem bedienbar (Tabs scrollbar, große Touch-Ziele). Dialoge über das <dialog>-Element. Sichtbarer Fokusrahmen, gute Kontraste, Beschriftungen an jedem Formularfeld.
+
+BEKANNTE FALLSTRICKE (bitte vermeiden)
+- Exclusion-Constraint nur mit tstzrange(start_at, end_at, '[)') und WHERE auf die aktiven Status; sonst blockieren abgesagte Termine.
+- Funktionen ohne „set search_path“ oder ohne revoke/grant sind in Supabase öffentlich aufrufbar.
+- Mehrere Funktionen mit gleichem Namen verursachen bei supabase-js „Could not choose the best candidate function“.
+- timestamptz kommt als ISO-String zurück; rechne im Browser immer mit Date und formatiere mit Intl (timeZone 'Europe/Berlin', hourCycle 'h23').
+- Kein new Date('2026-03-29T02:30') für Berliner Ortszeiten verwenden; Ortszeit→UTC nur über die Datenbank (admin) bzw. über Intl-basierte Hilfsfunktion (Kundenseite).
+- Datum-Hilfen für Kalender rechnen mit UTC-Mitternacht (Date.UTC), damit die Zeitzone des Geräts keine Tage verschiebt.
+- Auch bei Datenbankfehlern darf die Seite nie weiß werden: überall try/catch und sichtbare Fehlermeldung mit „Erneut versuchen“.
+
+AUSGABEFORMAT (genau so)
+1. Kurzer Überblick (max. 5 Zeilen).
+2. Codeblock „SQL 1 – Hauptskript“ (im Supabase SQL Editor einmal komplett ausführbar).
+3. Codeblock „SQL 2 – optional: Neustart (löscht NUR kf_-Daten)“.
+4. Codeblock „SQL 3 – Admin-Funktion und erste Admins“ (mit Platzhaltern in GROSSBUCHSTABEN).
+5. Codeblock „index.html“ (komplette Datei, vollständig, lauffähig).
+6. Einrichtung als nummerierte Liste mit je 1–2 Sätzen: SQL 1 im SQL Editor ausführen · Registrierung neuer Benutzer ausschalten · Admin-Benutzer im Dashboard anlegen · SQL 3 mit echten E-Mail-Adressen ausführen · Project URL und Publishable/anon Key (Project Settings > API) in index.html eintragen · index.html in einen Ordner legen und per Drag-and-drop bei Netlify hochladen (beschreibe keine Netlify-Menüs, die du nicht sicher kennst) · Funktionstest in 10 Punkten.
+7. Ein Satz mit den Entscheidungen, die du selbst getroffen hast.
+
+ABNAHME-CHECKLISTE (vor der Ausgabe selbst prüfen; alles muss „ja“ sein)
+ 1. Läuft SQL 1 auf einer leeren Supabase-Datenbank fehlerfrei durch und bricht bei zweitem Lauf mit klarer Meldung ab?
+ 2. RLS auf allen kf_-Tabellen an, keine Policies, keine Tabellenrechte für anon/authenticated?
+ 3. Hat jede Funktion set search_path, revoke und gezieltes grant?
+ 4. Kann anon eine kf_admin_*-Funktion aufrufen? (Antwort muss „nein“ sein.)
+ 5. Liefert kf_get_public_state irgendwelche Personendaten? (Antwort muss „nein“ sein.)
+ 6. Kann ein zweiter Kunde denselben oder überlappenden Zeitraum buchen? (nein) Direkt aufeinanderfolgende? (ja)
+ 7. Funktioniert 15-Minuten-Raster, variable Dauer, 24/7, 30-Tage-Frist, Mindestvorlauf?
+ 8. Geben abgelehnt/zurückgezogen/abgesagt den Zeitraum sofort frei?
+ 9. Ganze und teilweise Sperrzeiten, mehrere pro Tag, mehrere Wochen; Konfliktwarnung; bestehende Termine bleiben unangetastet?
+10. Annehmen/Ablehnen, danach weg aus „Anfragen“?
+11. Persönlicher Link: nur Hash gespeichert, nur eigene Daten sichtbar, Absage mit Sicherheitsabfrage, Zeitraum danach frei?
+12. Manueller Termin, Bearbeiten, Verschieben, Löschen, interne Notiz nie öffentlich?
+13. Drei Kalenderansichten im Adminbereich mit den Farben Gelb/Grün/Rot?
+14. Kundensuche nach Name, E-Mail, Telefon (auch +49-Schreibweise)?
+15. Sommerzeit-Tage (92 bzw. 100 Startzeiten) korrekt?
+16. Keine innerHTML-Einfügung von Daten? Keine Platzhalter, keine „…“ im Code?
+17. Nur zwei Werte (URL, Key) müssen in index.html eingetragen werden?
+18. Funktioniert alles auf Handy-, Tablet- und Desktop-Breite?
+
+=====================================================================
+ENDE DES PROMPTS
+=====================================================================
